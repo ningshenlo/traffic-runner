@@ -6,14 +6,15 @@ import random
 import re
 import string
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
-from fake_useragent import UserAgent
 
 
 SIMILARWEB_API_BASE = "https://data.similarweb.com/api/v1/data"
@@ -334,7 +335,6 @@ class SimilarWebClient:
         self.proxy_user = config.brightdata_proxy_user
         self.proxy_password = config.brightdata_proxy_password
         self.proxy_user_summary = mask_value(config.brightdata_proxy_user)
-        self.user_agent = UserAgent()
         log_info(
             "similarweb.client.config",
             proxy_host=self.proxy_host,
@@ -357,19 +357,31 @@ class SimilarWebClient:
             return FetchResult(status="failed", monthly_rows=[], error="invalid_domain")
 
         headers = {
-            "User-Agent": self.user_agent.random,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
             "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
+            "Origin": "https://www.similarweb.com",
+            "Referer": f"https://www.similarweb.com/website/{clean_domain}/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
         }
         url = f"{SIMILARWEB_API_BASE}?domain={clean_domain}"
         log_info("similarweb.fetch.start", domain=clean_domain, requested_month=requested_month)
 
         try:
-            async with httpx.AsyncClient(proxy=self.build_proxy_url(), headers=headers, timeout=25.0, verify=False) as client:
-                response = await client.get(url)
+            started_at = time.perf_counter()
+            async with CurlAsyncSession() as client:
+                response = await client.get(
+                    url,
+                    proxy=self.build_proxy_url(),
+                    headers=headers,
+                    timeout=25.0,
+                    verify=False,
+                    impersonate="chrome",
+                    default_headers=True,
+                )
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         except Exception as error:
             log_error(
                 "similarweb.fetch.request_error",
@@ -382,17 +394,19 @@ class SimilarWebClient:
             )
             return FetchResult(status="failed", monthly_rows=[], error=f"request_error:{str(error)[:300]}")
 
+        is_success = 200 <= response.status_code < 300
+        response_history = getattr(response, "history", []) or []
         log_info(
             "similarweb.fetch.response",
             domain=clean_domain,
             status_code=response.status_code,
-            elapsed_ms=int(response.elapsed.total_seconds() * 1000),
+            elapsed_ms=elapsed_ms,
             final_host=urlsplit(str(response.url)).netloc,
-            http_version=response.http_version,
-            history_statuses=[item.status_code for item in response.history],
+            http_version=str(getattr(response, "http_version", "")),
+            history_statuses=[item.status_code for item in response_history],
             **response_header_summary(response),
         )
-        if not response.is_success:
+        if not is_success:
             log_info(
                 "similarweb.fetch.response_body",
                 domain=clean_domain,
@@ -410,7 +424,7 @@ class SimilarWebClient:
                 monthly_rows=[],
                 error=f"similarweb_http_{response.status_code}:{response.text[:300]}",
             )
-        if not response.is_success:
+        if not is_success:
             return FetchResult(
                 status="failed",
                 monthly_rows=[],
