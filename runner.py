@@ -4089,6 +4089,22 @@ async def run_pricing_loop(
         await asyncio.sleep(interval_seconds)
 
 
+async def run_all_loop(config: Config, limit: int | None, interval_seconds: int, timeout_seconds: int | None) -> None:
+    shared_interval = interval_seconds or 300
+    traffic_interval = 1800
+    log_info(
+        "all_runner.loop.start",
+        traffic_interval_seconds=traffic_interval,
+        pricing_interval_seconds=shared_interval,
+        assets_interval_seconds=shared_interval,
+    )
+    await asyncio.gather(
+        run_loop(config, limit or config.limit, traffic_interval),
+        run_pricing_loop(config, config.pricing_limit, shared_interval, None, True, False, timeout_seconds),
+        run_assets_loop(config, config.asset_limit, shared_interval),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scheduled traffic, assets, and pricing runner")
     mode = parser.add_mutually_exclusive_group()
@@ -4096,6 +4112,7 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--loop", action="store_true", help="poll tasks forever")
     parser.add_argument("--pricing", action="store_true", help="process pricing_tasks instead of traffic_tasks")
     parser.add_argument("--assets", action="store_true", help="process asset_tasks instead of traffic_tasks")
+    parser.add_argument("--all", action="store_true", help="run traffic, pricing, and assets loops in one process")
     parser.add_argument("--approve-pricing", action="store_true", help="write approved pricing extractions into active catalogs")
     parser.add_argument("--dry-run", action="store_true", help="for pricing mode, fetch and extract without D1 writes")
     parser.add_argument("--task-id", type=int, action="append", default=[], help="pricing task id to run; can be repeated")
@@ -4103,8 +4120,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--interval-seconds", type=int, default=None)
     args = parser.parse_args()
-    if args.pricing and args.assets:
-        parser.error("--pricing and --assets are mutually exclusive")
+    selected = [args.pricing, args.assets, args.all]
+    if sum(1 for value in selected if value) > 1:
+        parser.error("--pricing, --assets, and --all are mutually exclusive")
+    if args.all and not args.loop:
+        parser.error("--all requires --loop")
     return args
 
 
@@ -4112,6 +4132,10 @@ def main() -> None:
     args = parse_args()
     config = load_config(require_brightdata=not (args.pricing or args.assets))
     interval_seconds = args.interval_seconds or config.poll_interval_seconds
+    if args.all:
+        asyncio.run(run_all_loop(config, args.limit, args.interval_seconds, args.timeout))
+        return
+
     if args.assets:
         if args.loop:
             asyncio.run(run_assets_loop(config, args.limit, interval_seconds))
