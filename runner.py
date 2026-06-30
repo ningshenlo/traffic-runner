@@ -3178,6 +3178,47 @@ class D1PricingStore:
             [tool_id, url, discovery_method, source_confidence, now, now, now],
         )
 
+    async def mark_pricing_source_discovery_skipped(
+        self,
+        tool_id: int,
+        url: str,
+        error: str,
+    ) -> None:
+        clean_url = (url or "").strip()
+        if not clean_url:
+            return
+        now = utc_now_iso()
+        await self.d1.run(
+            """
+            INSERT INTO pricing_sources (
+              tool_id,
+              url,
+              source_type,
+              scope,
+              locale,
+              region,
+              expected_currency,
+              fetch_mode,
+              discovery_method,
+              source_confidence,
+              is_active,
+              unchanged_runs,
+              next_run_at,
+              last_error,
+              created_at,
+              updated_at
+            )
+            VALUES (?, ?, 'marketing_pricing', 'individual', 'en-US', 'US', 'USD', 'static', 'homepage_link', 0, 0, 0, NULL, ?, ?, ?)
+            ON CONFLICT (tool_id, url, locale, region, scope) DO UPDATE SET
+              is_active = 0,
+              source_confidence = 0,
+              next_run_at = NULL,
+              last_error = excluded.last_error,
+              updated_at = ?
+            """,
+            [tool_id, clean_url, error[:2000], now, now, now],
+        )
+
     async def queue_due_tasks(self, limit: int) -> int:
         now = utc_now_iso()
         rows = await self.d1.query(
@@ -3869,6 +3910,13 @@ async def discover_missing_pricing_sources(
                 text_score=text_score,
             )
         else:
+            skip_error = result.error or f"{result.page_status}: HTTP {result.status}; text_score={text_score}"
+            if result.status:
+                await store.mark_pricing_source_discovery_skipped(
+                    candidate.tool_id,
+                    result.final_url or candidate.official_url,
+                    skip_error,
+                )
             log_info(
                 "pricing_source.discovery.skipped",
                 tool_id=candidate.tool_id,
