@@ -273,6 +273,12 @@ class AssetFetchResult:
     final_url: str
     screenshot: bytes
     html: str = ""
+    title: str = ""
+    description: str = ""
+    favicon_href: str = ""
+    category_l1: str = ""
+    category_l2: str = ""
+    key_features: list[dict[str, str]] | None = None
 
 
 @dataclass(frozen=True)
@@ -692,6 +698,52 @@ def read_html_attribute(tag: str, name: str) -> str:
     if not match or not match.group(1):
         return ""
     return match.group(1).strip().strip("\"'").strip()
+
+
+def clean_asset_text(value: Any, limit: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return html.unescape(text)[:limit]
+
+
+def clean_category_slug(value: Any) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    return slug if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,119}", slug) and slug != "uncategorized" else ""
+
+
+def clean_key_features(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    features: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        name = clean_asset_text(raw.get("name") or raw.get("feature_name"), 120)
+        key = name.lower()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        features.append({
+            "name": name,
+            "description": clean_asset_text(raw.get("description") or raw.get("feature_description"), 240),
+        })
+        if len(features) >= 6:
+            break
+    return features
+
+
+def read_html_title(html_body: str) -> str:
+    match = re.search(r"<title[^>]*>([\s\S]*?)</title>", html_body or "", re.I)
+    return clean_asset_text(match.group(1), 120) if match else ""
+
+
+def read_html_meta(html_body: str, names: set[str]) -> str:
+    for tag in re.findall(r"<meta\b[^>]*>", html_body or "", re.I):
+        key = (read_html_attribute(tag, "property") or read_html_attribute(tag, "name")).lower()
+        content = read_html_attribute(tag, "content")
+        if key in names and content:
+            return clean_asset_text(content, 500)
+    return ""
 
 
 def extract_favicon_href(html_body: str, page_url: str) -> str | None:
@@ -1656,7 +1708,52 @@ class CloudflareBrowserRunAssetClient:
             raise RuntimeError(message or text[:300] or f"HTTP {response.status_code}")
         return parsed.get("result") if isinstance(parsed, dict) and "result" in parsed else parsed
 
-    async def fetch_homepage_asset(self, task: AssetTask) -> AssetFetchResult:
+    async def fetch_homepage_metadata(self, target_url: str, category_options: list[str]) -> dict[str, Any]:
+        category_hint = ", ".join(category_options[:180])
+        extracted = await self.call_quick_action(
+            "json",
+            {
+                "url": target_url,
+                "userAgent": random_pricing_user_agent(),
+                "prompt": (
+                    "Extract the product title, short description, favicon href, 3 to 6 concrete product "
+                    "features, and the best category slugs for this AI tool. Use only category slugs from "
+                    f"this list when possible: {category_hint}. Return empty strings when unsure."
+                ),
+                "response_format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                            "favicon_href": {"type": "string"},
+                            "category_l1": {"type": "string"},
+                            "category_l2": {"type": "string"},
+                            "key_features": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "description": {"type": "string"},
+                                    },
+                                    "required": ["name"],
+                                },
+                            },
+                        },
+                        "required": ["title", "description"],
+                    },
+                },
+                "gotoOptions": {
+                    "waitUntil": "domcontentloaded",
+                    "timeout": self.timeout_seconds * 1000,
+                },
+            },
+        )
+        return extracted if isinstance(extracted, dict) else {}
+
+    async def fetch_homepage_asset(self, task: AssetTask, category_options: list[str]) -> AssetFetchResult:
         primary_url = asset_page_url(task)
         parsed = urlsplit(primary_url)
         candidates = [primary_url]
@@ -1685,21 +1782,41 @@ class CloudflareBrowserRunAssetClient:
                     screenshot_raw = screenshot_raw.split(",", 1)[1]
                 screenshot = base64.b64decode(str(screenshot_raw), validate=False)
                 html_body = ""
+                metadata: dict[str, Any] = {}
                 try:
-                    content = await self.call_quick_action(
-                        "content",
-                        {
-                            **payload,
-                            "rejectResourceTypes": ["image", "media", "font"],
-                        },
-                    )
-                    if isinstance(content, dict):
-                        html_body = str(content.get("content") or content.get("html") or "")
-                    elif isinstance(content, str):
-                        html_body = content
-                except Exception as content_error:
-                    log_info("assets.browser_content.failed", url=target_url, error=str(content_error)[:300])
-                return AssetFetchResult(final_url=target_url, screenshot=screenshot, html=html_body)
+                    metadata = await self.fetch_homepage_metadata(target_url, category_options)
+                except Exception as metadata_error:
+                    log_info("assets.browser_metadata.failed", url=target_url, error=str(metadata_error)[:300])
+                    try:
+                        content = await self.call_quick_action(
+                            "content",
+                            {
+                                **payload,
+                                "rejectResourceTypes": ["image", "media", "font"],
+                            },
+                        )
+                        if isinstance(content, dict):
+                            html_body = str(content.get("content") or content.get("html") or "")
+                        elif isinstance(content, str):
+                            html_body = content
+                    except Exception as content_error:
+                        log_info("assets.browser_content.failed", url=target_url, error=str(content_error)[:300])
+                title = clean_asset_text(metadata.get("title"), 120) or read_html_title(html_body)
+                description = clean_asset_text(metadata.get("description"), 500) or read_html_meta(
+                    html_body,
+                    {"description", "og:description", "twitter:description"},
+                )
+                return AssetFetchResult(
+                    final_url=target_url,
+                    screenshot=screenshot,
+                    html=html_body,
+                    title=title,
+                    description=description,
+                    favicon_href=clean_asset_text(metadata.get("favicon_href"), 1000),
+                    category_l1=clean_category_slug(metadata.get("category_l1")),
+                    category_l2=clean_category_slug(metadata.get("category_l2")),
+                    key_features=clean_key_features(metadata.get("key_features")),
+                )
             except Exception as error:
                 errors.append(f"{target_url}: {str(error)[:220]}")
 
@@ -2517,7 +2634,7 @@ class D1Client:
             SELECT id
             FROM tools
             WHERE normalized_domain = ?
-              AND status = 'published'
+              AND status IN ('published', 'pending_enrich')
               AND duplicate_of_tool_id IS NULL
             """,
             [domain],
@@ -2594,7 +2711,7 @@ class D1AssetStore:
             LEFT JOIN asset_tasks task
               ON task.tool_id = t.id
              AND task.source = ?
-            WHERE t.status = 'published'
+            WHERE t.status IN ('published', 'pending_enrich')
               AND t.duplicate_of_tool_id IS NULL
               AND trim(t.normalized_domain) <> ''
               AND (
@@ -2790,6 +2907,163 @@ class D1AssetStore:
             [task.tool_id, asset_kind, ASSET_DB_STORAGE_BUCKET, storage_object_path, public_url, mime_type, width, height],
         )
 
+    async def category_options(self) -> list[str]:
+        rows = await self.d1.query(
+            """
+            SELECT canonical_slug
+            FROM categories
+            WHERE status = 'active'
+            ORDER BY parent_category_id IS NOT NULL, display_order, canonical_slug
+            """,
+        )
+        return [str(row.get("canonical_slug") or "") for row in rows if row.get("canonical_slug")]
+
+    async def save_tool_localization(self, task: AssetTask, result: AssetFetchResult) -> None:
+        title = clean_asset_text(result.title, 120)
+        description = clean_asset_text(result.description, 500)
+        if not title and not description:
+            return
+        rows = await self.d1.query(
+            """
+            SELECT locale_code
+            FROM tool_localizations
+            WHERE tool_id = ?
+            ORDER BY CASE WHEN locale_code = 'en' THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            [task.tool_id],
+        )
+        locale = str(rows[0].get("locale_code") or "") if rows else ""
+        if not locale:
+            locale_rows = await self.d1.query(
+                """
+                SELECT code
+                FROM app_locales
+                WHERE code = 'en' OR is_primary = 1
+                ORDER BY CASE WHEN code = 'en' THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+            )
+            locale = str(locale_rows[0].get("code") or "") if locale_rows else ""
+            if not locale:
+                return
+            await self.d1.run(
+                """
+                INSERT OR IGNORE INTO tool_localizations (
+                  tool_id, locale_code, localized_slug, name, tagline, short_description, feature_highlights,
+                  translation_status, published_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, '[]', 'published', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                """,
+                [task.tool_id, locale, task.canonical_slug, title or task.canonical_slug, description or None, description or None],
+            )
+            return
+
+        await self.d1.run(
+            """
+            UPDATE tool_localizations
+            SET name = CASE
+                  WHEN ? <> '' AND (name IS NULL OR trim(name) = '' OR name = ?)
+                  THEN ?
+                  ELSE name
+                END,
+                tagline = CASE
+                  WHEN ? <> '' AND (tagline IS NULL OR trim(tagline) = '')
+                  THEN ?
+                  ELSE tagline
+                END,
+                short_description = CASE
+                  WHEN ? <> '' AND (short_description IS NULL OR trim(short_description) = '')
+                  THEN ?
+                  ELSE short_description
+                END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE tool_id = ?
+              AND locale_code = ?
+            """,
+            [
+                title,
+                task.canonical_slug,
+                title,
+                description,
+                description,
+                description,
+                description,
+                task.tool_id,
+                locale,
+            ],
+        )
+
+    async def save_tool_categories(self, task: AssetTask, result: AssetFetchResult) -> None:
+        slugs = [slug for slug in (result.category_l2, result.category_l1) if slug]
+        slugs = list(dict.fromkeys(slugs))
+        if not slugs:
+            return
+        rows = await self.d1.query(
+            f"""
+            SELECT
+              c.id,
+              c.canonical_slug,
+              c.parent_category_id,
+              parent.id AS parent_id,
+              parent.canonical_slug AS parent_slug
+            FROM categories c
+            LEFT JOIN categories parent
+              ON parent.id = c.parent_category_id
+             AND parent.status = 'active'
+            WHERE c.status = 'active'
+              AND c.canonical_slug IN ({placeholders(len(slugs))})
+            """,
+            slugs,
+        )
+        by_slug = {str(row.get("canonical_slug")): row for row in rows}
+        specific = next((by_slug.get(slug) for slug in slugs if by_slug.get(slug)), None)
+        if not specific:
+            return
+        primary_id = int(specific.get("parent_id") or specific.get("id") or 0)
+        specific_id = int(specific.get("id") or 0)
+        for category_id in dict.fromkeys([primary_id, specific_id]):
+            if category_id > 0:
+                await self.d1.run(
+                    "INSERT OR IGNORE INTO tool_categories (tool_id, category_id) VALUES (?, ?)",
+                    [task.tool_id, category_id],
+                )
+        if primary_id > 0:
+            await self.d1.run(
+                """
+                UPDATE tools
+                SET primary_category_id = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?
+                  AND primary_category_id IS NULL
+                """,
+                [primary_id, task.tool_id],
+            )
+
+    async def save_tool_features(self, task: AssetTask, result: AssetFetchResult) -> None:
+        features = clean_key_features(result.key_features)
+        if not features:
+            return
+        await self.d1.run(
+            "DELETE FROM tool_key_features WHERE tool_id = ? AND source = ?",
+            [task.tool_id, ASSET_SOURCE],
+        )
+        for position, feature in enumerate(features):
+            await self.d1.run(
+                """
+                INSERT INTO tool_key_features (
+                  tool_id, feature_name, feature_description, position, source
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [task.tool_id, feature["name"], feature["description"] or None, position, ASSET_SOURCE],
+            )
+
+    async def save_tool_enrichment(self, task: AssetTask, result: AssetFetchResult) -> None:
+        await self.save_tool_localization(task, result)
+        await self.save_tool_categories(task, result)
+        await self.save_tool_features(task, result)
+
     async def complete_task(self, task: AssetTask, status: str, error: str | None = None) -> None:
         now = utc_now_iso()
         await self.d1.run(
@@ -2834,7 +3108,7 @@ class D1TaskStore:
               ON task.normalized_domain = t.normalized_domain
              AND task.source = ?
              AND task.traffic_month = ?
-            WHERE t.status = 'published'
+            WHERE t.status IN ('published', 'pending_enrich')
               AND t.duplicate_of_tool_id IS NULL
               AND trim(t.normalized_domain) <> ''
               AND tm.traffic_month IS NULL
@@ -3020,7 +3294,7 @@ class D1TaskStore:
               ?
             FROM tools
             WHERE normalized_domain = ?
-              AND status = 'published'
+              AND status IN ('published', 'pending_enrich')
               AND duplicate_of_tool_id IS NULL
             ON CONFLICT (tool_id, source) DO UPDATE
             SET normalized_domain = excluded.normalized_domain,
@@ -3056,7 +3330,7 @@ class D1DomainStateStore:
             LEFT JOIN domain_states ds
               ON ds.normalized_domain = t.normalized_domain
              AND ds.source = ?
-            WHERE t.status = 'published'
+            WHERE t.status IN ('published', 'pending_enrich')
               AND t.duplicate_of_tool_id IS NULL
               AND trim(t.normalized_domain) <> ''
               AND (
@@ -3119,7 +3393,7 @@ class D1PricingStore:
               t.official_url
             FROM tools t
             LEFT JOIN pricing_sources ps ON ps.tool_id = t.id
-            WHERE t.status = 'published'
+            WHERE t.status IN ('published', 'pending_enrich')
               AND t.duplicate_of_tool_id IS NULL
               AND ps.id IS NULL
               AND t.official_url IS NOT NULL
@@ -3236,7 +3510,7 @@ class D1PricingStore:
             LEFT JOIN latest_task lt ON lt.pricing_source_id = ps.id
             LEFT JOIN pricing_tasks task ON task.id = lt.task_id
             WHERE ps.is_active = 1
-              AND t.status = 'published'
+              AND t.status IN ('published', 'pending_enrich')
               AND t.duplicate_of_tool_id IS NULL
               AND (
                 ps.next_run_at IS NULL
@@ -3691,8 +3965,8 @@ async def process_domain_state(
     return result.status
 
 
-async def fetch_favicon_asset(page_url: str, domain: str, html_body: str) -> FaviconAsset | None:
-    favicon_url = extract_favicon_href(html_body, page_url)
+async def fetch_favicon_asset(page_url: str, domain: str, html_body: str, favicon_href: str = "") -> FaviconAsset | None:
+    favicon_url = urljoin(page_url, favicon_href) if favicon_href else extract_favicon_href(html_body, page_url)
     if not favicon_url:
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
@@ -3749,6 +4023,7 @@ async def process_asset_task(
     store: D1AssetStore,
     public_base_url: str,
     max_retries: int,
+    category_options: list[str],
 ) -> str:
     last_error = "not_started"
     for attempt in range(max_retries + 1):
@@ -3761,7 +4036,7 @@ async def process_asset_task(
                 attempt=attempt + 1,
                 max_attempts=max_retries + 1,
             )
-            result = await browser_client.fetch_homepage_asset(task)
+            result = await browser_client.fetch_homepage_asset(task, category_options)
             screenshot_key = f"{task.normalized_domain}/{int(time.time() * 1000)}.png"
             await uploader.put_object(screenshot_key, result.screenshot, "image/png")
             await store.upsert_tool_asset(
@@ -3774,7 +4049,7 @@ async def process_asset_task(
                 720,
             )
 
-            favicon = await fetch_favicon_asset(result.final_url, task.normalized_domain, result.html)
+            favicon = await fetch_favicon_asset(result.final_url, task.normalized_domain, result.html, result.favicon_href)
             if favicon is not None:
                 await uploader.put_object(favicon.key, favicon.body, favicon.mime_type)
                 await store.upsert_tool_asset(
@@ -3787,6 +4062,17 @@ async def process_asset_task(
                     None,
                 )
 
+            try:
+                await store.save_tool_enrichment(task, result)
+            except Exception as enrichment_error:
+                log_error(
+                    "asset_task.enrichment_failed",
+                    tool_id=task.tool_id,
+                    slug=task.canonical_slug,
+                    domain=task.normalized_domain,
+                    error=str(enrichment_error)[:300],
+                )
+
             await store.complete_task(task, "done")
             log_info(
                 "asset_task.fetch_attempt.done",
@@ -3795,6 +4081,7 @@ async def process_asset_task(
                 domain=task.normalized_domain,
                 status="done",
                 favicon=bool(favicon),
+                enriched=bool(result.title or result.description or result.category_l1 or result.category_l2 or result.key_features),
             )
             return "done"
         except Exception as error:
@@ -4106,6 +4393,7 @@ async def run_assets_once(config: Config, limit: int | None = None) -> dict[str,
     await uploader.check_access()
     d1 = D1Client(config)
     store = D1AssetStore(d1)
+    category_options = await store.category_options()
     queued = await store.queue_missing_asset_tasks(effective_limit)
     log_info("assets_runner.queue_missing_asset_tasks.done", queued=queued)
     tasks = await store.claim_due_tasks(effective_limit)
@@ -4129,6 +4417,7 @@ async def run_assets_once(config: Config, limit: int | None = None) -> dict[str,
                     store,
                     config.r2_public_base_url,
                     config.max_retries,
+                    category_options,
                 )
             except Exception as error:
                 status = "failed"
@@ -4341,17 +4630,19 @@ async def run_pricing_loop(
 
 async def run_all_loop(config: Config, limit: int | None, interval_seconds: int, timeout_seconds: int | None) -> None:
     shared_interval = interval_seconds or 300
-    traffic_interval = 1800
+    assets_interval = max(60, shared_interval // 2)
+    traffic_interval = shared_interval
+    pricing_interval = max(900, shared_interval * 3)
     log_info(
         "all_runner.loop.start",
+        assets_interval_seconds=assets_interval,
         traffic_interval_seconds=traffic_interval,
-        pricing_interval_seconds=shared_interval,
-        assets_interval_seconds=shared_interval,
+        pricing_interval_seconds=pricing_interval,
     )
     await asyncio.gather(
+        run_assets_loop(config, config.asset_limit, assets_interval),
         run_loop(config, limit or config.limit, traffic_interval),
-        run_pricing_loop(config, config.pricing_limit, shared_interval, None, True, False, timeout_seconds),
-        run_assets_loop(config, config.asset_limit, shared_interval),
+        run_pricing_loop(config, config.pricing_limit, pricing_interval, None, True, False, timeout_seconds),
     )
 
 
